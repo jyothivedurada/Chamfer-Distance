@@ -15,10 +15,7 @@
 #define DIMS 128
 
 #define TILE_SIZE 32
-#define WORK_SIZE 20
-
-#define SUM_X 1
-#define SUM_Y 1
+#define WORK_SIZE 10
 
 #define MAX_POINTS 10000
 #define MAX_DIMS 1024
@@ -41,6 +38,7 @@ __global__ void computeSqrDiffs(int m, int n, int dims, dtype *s1, dtype *s2, dt
     
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     int k = blockIdx.x * blockDim.x + threadIdx.x;
+    int k_local = k%32;
 
     int group = blockIdx.z;
     int starting_j = group*WORK_SIZE;
@@ -49,9 +47,9 @@ __global__ void computeSqrDiffs(int m, int n, int dims, dtype *s1, dtype *s2, dt
     stopping_j = n ^ ((stopping_j ^ n) & -(stopping_j < n));
 
     if (k >= dims) return;
-    
-    for (int j = starting_j + threadIdx.y; j < stopping_j; j += blockDim.y) {
-        s2_data[local_s2_offset + j*blockDim.x + k] = s2[j*dims + k];
+
+    for (int j = starting_j + threadIdx.y; j < stopping_j; j += blockDim.y) { 
+        s2_data[local_s2_offset + j*blockDim.x + k_local] = s2[j*dims + k];
     }
 
     if (i >= m) return;
@@ -60,63 +58,32 @@ __global__ void computeSqrDiffs(int m, int n, int dims, dtype *s1, dtype *s2, dt
     __syncthreads();   
 
     for (int j = starting_j; j < stopping_j; j++) {
-        dtype diff = s1_elem - s2_data[local_s2_offset + j*blockDim.x + k];
+        dtype diff = s1_elem - s2_data[local_s2_offset + j*blockDim.x + k_local];
         res[(i * n * dims) + (j * dims) + k] = diff * diff;
     }
 }
 
 __global__ void sumDiffs(int m, int n, int dims, dtype *sqrDiffs, dtype *res) {
-    __shared__ dtype sharedMemory[32*SUM_X*SUM_Y];
-    dtype* vec = sharedMemory;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int wid = tid / 32;
 
-    int i = blockIdx.y*SUM_X;
-    int j_0 = blockIdx.z*SUM_Y;
-    int j;
-    int s_i = i+SUM_X;
-    int s_j = j_0+SUM_Y;
-    s_i = m ^ ((s_i ^ m) & -(s_i < m));
-    s_j = n ^ ((s_j ^ n) & -(s_j < n));
+    int i = wid % m;
+    int j = wid / m;
 
-    int k = threadIdx.x;
-    int w = k >> 5;
+    if (i >= m || j >= n) return;
 
-    dtype v = 0;
-
-    if (k >= dims) return;
-    if (k <= 31) vec[k] = 0;
-
-    for (; i < s_i; i++) {
-        for (j=j_0; j < s_j; j++) {
-
-            v = sqrDiffs[(i * n * dims) + (j * dims) + k];
-            v += __shfl_down_sync(FULL_MASK, v, 16);
-            v += __shfl_down_sync(FULL_MASK, v, 8);
-            v += __shfl_down_sync(FULL_MASK, v, 4);
-            v += __shfl_down_sync(FULL_MASK, v, 2);
-            v += __shfl_down_sync(FULL_MASK, v, 1);
-            if (k%32 == 0) vec[w] = v;
-
-            vec += 32;
-        }
+    dtype sum = 0;
+    for (int k = tid % 32; k < dims; k += 32) {
+        sum += sqrDiffs[i*n*dims + j*dims + k];
     }
-
-    k = k % 32;
-    __syncthreads();
-
-    for (int id = w; id < SUM_X*SUM_Y; id += blockDim.x>>5) {
-        i = blockIdx.y + (id / SUM_Y);
-        j = blockIdx.z + (id % SUM_Y);  
-        vec = sharedMemory + 32*id;  
-                
-        v = vec[k];
-        v += __shfl_down_sync(FULL_MASK, v, 16);
-        v += __shfl_down_sync(FULL_MASK, v, 8);
-        v += __shfl_down_sync(FULL_MASK, v, 4);
-        v += __shfl_down_sync(FULL_MASK, v, 2);
-        v += __shfl_down_sync(FULL_MASK, v, 1);
-
-        if (k == 0) res[i*n + j] = v; 
-   }
+    
+    sum += __shfl_down_sync(FULL_MASK, sum, 16);
+    sum += __shfl_down_sync(FULL_MASK, sum, 8);
+    sum += __shfl_down_sync(FULL_MASK, sum, 4);
+    sum += __shfl_down_sync(FULL_MASK, sum, 2);
+    sum += __shfl_down_sync(FULL_MASK, sum, 1);
+    
+    if (tid % 32 == 0) res[i*n + j] = sqrt(sum);
 }
 
 // Computes the minimum of each row (i.e. minimum distance of each point in S1
@@ -137,20 +104,19 @@ __global__ void minReduceEachRow(int m, int n, int dims, dtype *dists) {
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 4));
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 2)); 
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 1)); 
-    vec[i>>5] = v;
+    if (i % 32 == 0) vec[i>>5] = v;
 
-    __syncthreads();
-    
-    
+    __syncthreads();  
     if (i > 31) return;
 
-    v = (i > n>>5) * DTYPE_MAX + (i <= n>>5) * vec[i];
+    v = DTYPE_MAX;
+    if (i < (n >> 5)) v = vec[i];
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 16));
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 8));
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 4));
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 2));
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 1));
-    dists[row*n] = v;
+    if (i == 0) dists[row*n] = v;
 }
 
 // Compute the minimum of each column (i.e. minimum distance of each point in S2
@@ -171,18 +137,19 @@ __global__ void minReduceEachCol(int m, int n, int dims, dtype *dists) {
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 4));
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 2));
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 1));
-    vec[i>>5] = v;
+    if (i % 32 == 0) vec[i>>5] = v;
 
     __syncthreads();
     if (i > 31) return;
 
-    v = (i > m>>5) * DTYPE_MAX + (i <= m>>5) * vec[i];
+    v = DTYPE_MAX;
+    if (i < (n >> 5)) v = vec[i];
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 16));
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 8));
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 4));
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 2));
     v = fminf(v, __shfl_down_sync(FULL_MASK, v, 1));
-    dists[col] = v;
+    if (i == 0) dists[col] = v;
 }
 
 // Computes the sum of first elements of each row
@@ -200,18 +167,18 @@ __global__ void sumRowMins(int m, int n, int dims, dtype *dists) {
     v += __shfl_down_sync(FULL_MASK, v, 4);
     v += __shfl_down_sync(FULL_MASK, v, 2);
     v += __shfl_down_sync(FULL_MASK, v, 1);
-    vec[i>>5] = v;
+    if (i % 32 == 0) vec[i>>5] = v;
     
     __syncthreads();
     if (i > 31) return;
 
-    v = (i <= m>>5) * vec[i];
+    v = (i < m>>5) * vec[i];
     v += __shfl_down_sync(FULL_MASK, v, 16);
     v += __shfl_down_sync(FULL_MASK, v, 8);
     v += __shfl_down_sync(FULL_MASK, v, 4);
     v += __shfl_down_sync(FULL_MASK, v, 2);
     v += __shfl_down_sync(FULL_MASK, v, 1);
-    dists[0] = v;
+    if (i == 0) dists[0] = v;
 }
 
 // Computes the sum of first elements of each column
@@ -229,35 +196,35 @@ __global__ void sumColMins(int m, int n, int dims, dtype *dists) {
     v += __shfl_down_sync(FULL_MASK, v, 4);
     v += __shfl_down_sync(FULL_MASK, v, 2);
     v += __shfl_down_sync(FULL_MASK, v, 1);
-    vec[i>>5] = v;
+    if (i % 32 == 0) vec[i>>5] = v;
     
     __syncthreads();
     if (i > 31) return;
 
-    v = (i <= n>>5) * vec[i];
+    v = (i < n>>5) * vec[i];
     v += __shfl_down_sync(FULL_MASK, v, 16);
     v += __shfl_down_sync(FULL_MASK, v, 8);
     v += __shfl_down_sync(FULL_MASK, v, 4);
     v += __shfl_down_sync(FULL_MASK, v, 2);
     v += __shfl_down_sync(FULL_MASK, v, 1);
-    dists[0] = v;
+    if (i == 0) dists[0] = v;
 }
 
 // Implementation of Chamfer distance calculation with verbose parameter added
 dtype computeChamferDistance(dtype *s1_h, int m, dtype *s2_h, int n, int dims, int verbose) {
     cudaEvent_t start, stop;
     float milliseconds = 0;
+      
+    cudaStream_t stream1, stream2;
+    cudaStreamCreate(&stream1);
+    cudaStreamCreate(&stream2);
     
     if (verbose) {
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
         cudaEventRecord(start);
     }
-    
-    cudaStream_t stream1, stream2;
-    cudaStreamCreate(&stream1);
-    cudaStreamCreate(&stream2);
-    
+
     dtype *s1_d, *s2_d, *sqrDiffs_d, *dists_d, *dists2_d;
 
     gpuErrchk(cudaMalloc(&s1_d, m * dims * sizeof(dtype)));
@@ -273,19 +240,16 @@ dtype computeChamferDistance(dtype *s1_h, int m, dtype *s2_h, int n, int dims, i
     computeSqrDiffs<<<dim3((dims+31)/32, (m+31)/32, (n+WORK_SIZE-1)/WORK_SIZE), dim3(32, 32, 1), sizeof(dtype) * 32 * WORK_SIZE>>>(
         m, n, dims, s1_d, s2_d, sqrDiffs_d);
  
-
     // Compute distances
-    sumDiffs<<<dim3(1, m/SUM_X, n/SUM_Y), dim3(dims, 1, 1)>>>(m, n, dims, sqrDiffs_d, dists_d);
-
-    
+    sumDiffs<<<(32 * m * n + 1023) / 1024, 1024>>>(m, n, dims, sqrDiffs_d, dists_d);   
 
     // Copy distances
     gpuErrchk(cudaMemcpy(dists2_d, dists_d, m * n * sizeof(dtype), cudaMemcpyDeviceToDevice));
 
     // Reductions along the two dimensions can be done parallely on different streams
     minReduceEachRow<<<m, (((n-1)/32)+1)*32, 0, stream1>>>(m, n, dims, dists_d);
-    minReduceEachCol<<<n, (((m-1)/32)+1)*32, 0, stream2>>>(m, n, dims, dists2_d);
-    
+    minReduceEachCol<<<n, (((m-1)/32)+1)*32, 0, stream2>>>(m, n, dims, dists2_d); 
+
     sumRowMins<<<1, m, 0, stream1>>>(m, n, dims, dists_d);
     sumColMins<<<1, n, 0, stream2>>>(m, n, dims, dists2_d);
 
@@ -297,7 +261,7 @@ dtype computeChamferDistance(dtype *s1_h, int m, dtype *s2_h, int n, int dims, i
     gpuErrchk(cudaMemcpy(&rowSum, dists_d, sizeof(dtype), cudaMemcpyDeviceToHost));
     gpuErrchk(cudaMemcpy(&colSum, dists2_d, sizeof(dtype), cudaMemcpyDeviceToHost));
 
-    dtype distance = rowSum + colSum;
+    dtype distance = rowSum/m + colSum/n;
 
     gpuErrchk(cudaFree(s1_d));
     gpuErrchk(cudaFree(s2_d));
@@ -318,6 +282,15 @@ dtype computeChamferDistance(dtype *s1_h, int m, dtype *s2_h, int n, int dims, i
     }
 
     return distance;
+}
+
+void readPointsFromCSV(FILE *f, dtype *points, int numPoints, int dims) {
+    for (int i = 0; i < numPoints; i++) {
+        fscanf(f, " %f", &points[i*dims]);
+        for (int j = 1; j < dims; j++) {
+            fscanf(f, ",%f", &points[i*dims + j]);
+        }
+    }
 }
 
 // Generate random points within a specified range
@@ -414,11 +387,20 @@ int main(int argc, char *argv[]) {
     generateRandomPoints(s1, m, dims, range);
     generateRandomPoints(s2, n, dims, range);
 
+    /*
+    FILE *f1 = fopen("public_small2_pointsetA.csv", "r"),
+         *f2 = fopen("public_small2_pointsetB.csv", "r");
+    readPointsFromCSV(f1, s1, m, dims);
+    readPointsFromCSV(f2, s2, m, dims);
+    fclose(f1);
+    fclose(f2);
+    */
+
     if (verbose) {
         printf("Points 1: %d points, %d dimensions\n", m, dims);
         printf("Points 2: %d points, %d dimensions\n", n, dims);
         
-        if (verbose > 1 && m <= 10 && n <= 10) {
+        if (verbose > 1) {
             printf("\nPoints 1 (first few):\n");
             for (int i = 0; i < min(5, m); i++) {
                 printf("  ");
