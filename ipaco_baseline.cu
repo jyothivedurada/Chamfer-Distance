@@ -192,12 +192,8 @@ dtype computeChamferDistance(dtype *s1_h, int m, dtype *s2_h, int n, int dims, i
         cudaEventCreate(&stop);
         cudaEventRecord(start);
     }
-
-    dtype *s1_d, *s2_d, *dists_d, *dists2_d;
     
-    cudaStream_t stream1, stream2;
-    cudaStreamCreate(&stream1);
-    cudaStreamCreate(&stream2);
+    dtype *s1_d, *s2_d, *dists_d, *dists2_d;    
 
     gpuErrchk(cudaMalloc(&s1_d, m * dims * sizeof(dtype)));
     gpuErrchk(cudaMalloc(&s2_d, n * dims * sizeof(dtype)));
@@ -214,15 +210,14 @@ dtype computeChamferDistance(dtype *s1_h, int m, dtype *s2_h, int n, int dims, i
     gpuErrchk(cudaMemcpy(dists2_d, dists_d, m * n * sizeof(dtype), cudaMemcpyDeviceToDevice));
 
     // Reductions along the two dimensions can be done parallely on different streams
-    minReduceEachRow<<<m, (((n-1)/32)+1)*32, 0, stream1>>>(m, n, dims, dists_d);
-    minReduceEachCol<<<n, (((m-1)/32)+1)*32, 0, stream2>>>(m, n, dims, dists2_d); 
+    minReduceEachRow<<<m, (((n-1)/32)+1)*32, 0>>>(m, n, dims, dists_d);
+    minReduceEachCol<<<n, (((m-1)/32)+1)*32, 0>>>(m, n, dims, dists2_d); 
 
-    sumRowMins<<<1, m, 0, stream1>>>(m, n, dims, dists_d);
-    sumColMins<<<1, n, 0, stream2>>>(m, n, dims, dists2_d);
+    sumRowMins<<<1, m, 0>>>(m, n, dims, dists_d);
+    sumColMins<<<1, n, 0>>>(m, n, dims, dists2_d);
 
-    gpuErrchk(cudaStreamSynchronize(stream1));
-    gpuErrchk(cudaStreamSynchronize(stream2));
-    
+    cudaDeviceSynchronize();   
+ 
     // Transfer results to host
     dtype rowSum, colSum;
     gpuErrchk(cudaMemcpy(&rowSum, dists_d, sizeof(dtype), cudaMemcpyDeviceToHost));
@@ -236,9 +231,6 @@ dtype computeChamferDistance(dtype *s1_h, int m, dtype *s2_h, int n, int dims, i
     gpuErrchk(cudaFree(dists_d));
     gpuErrchk(cudaFree(dists2_d));
     
-    cudaStreamDestroy(stream1);
-    cudaStreamDestroy(stream2);
-
     if (verbose) {
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
@@ -251,6 +243,7 @@ dtype computeChamferDistance(dtype *s1_h, int m, dtype *s2_h, int n, int dims, i
     return distance;
 }
 
+
 void readPointsFromCSV(FILE *f, dtype *points, int numPoints, int dims) {
     for (int i = 0; i < numPoints; i++) {
         fscanf(f, " %f", &points[i*dims]);
@@ -260,75 +253,63 @@ void readPointsFromCSV(FILE *f, dtype *points, int numPoints, int dims) {
     }
 }
 
-// Generate random points within a specified range
-void generateRandomPoints(dtype *points, int numPoints, int dims, float range) {
-    for (int i = 0; i < numPoints * dims; i++) {
-        points[i] = ((dtype)rand() / RAND_MAX) * range;
+int countColumns(const char *line) {
+    int count = 1;
+    for (int i = 0; line[i] != '\0'; i++) {
+        if (line[i] == ',') {
+            count++;
+        }
     }
+    return count;
 }
 
-// Print usage information
-void printUsage(const char *programName) {
-    printf("Usage: %s [options]\n", programName);
-    printf("Options:\n");
-    printf("  -m <int>     : Number of points in first set (default: %d)\n", M);
-    printf("  -n <int>     : Number of points in second set (default: %d)\n", N);
-    printf("  -d <int>     : Dimensions of points (default: %d)\n", DIMS);
-    printf("  -r <float>   : Range for random point values [0, range] (default: 1.0)\n");
-    printf("  -i <int>     : Number of iterations (default: 10, 1 if profiling)\n");
-    printf("  -v           : Verbose output\n");
-    printf("  -vv          : Extra verbose output (prints distance matrix)\n");
-    printf("  -h           : Show this help message\n");
+#define MAX_LINE_LENGTH 20000
+
+int getCSVDimensions(const char *filename, int *height, int *width) {
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        fprintf(stderr, "Could not open %s\n", filename);
+        return 0;
+    }
+
+    char line[MAX_LINE_LENGTH];
+    *height = 0;
+    *width = 0;
+
+    while (fgets(line, sizeof(line), file)) {
+        if (*height == 0) {
+            *width = countColumns(line);
+        }
+        (*height)++;
+    }
+
+    fclose(file);
+    return 1;
 }
+
 
 // Driver function
 int main(int argc, char *argv[]) {
-    int m = M;
-    int n = N;
-    int dims = DIMS;
-    float range = 1.0f;
-    int verbose = 0;
-    int num_iter = 10;
+    srand(time(NULL));
 
-    #ifdef PROFILE
-        num_iter = 1;
-    #endif
-
-    // Parse command line arguments
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-m") == 0 && i+1 < argc) {
-            m = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-n") == 0 && i+1 < argc) {
-            n = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-d") == 0 && i+1 < argc) {
-            dims = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-r") == 0 && i+1 < argc) {
-            range = atof(argv[++i]);
-        } else if (strcmp(argv[i], "-i") == 0 && i+1 < argc) {
-            num_iter = atoi(argv[++i]);
-            #ifdef PROFILE
-                printf("Note: In PROFILE mode, iterations are fixed to 1\n");
-                num_iter = 1;
-            #endif
-        } else if (strcmp(argv[i], "-v") == 0) {
-            verbose = 1;
-        } else if (strcmp(argv[i], "-vv") == 0) {
-            verbose = 2;
-        } else if (strcmp(argv[i], "-h") == 0) {
-            printUsage(argv[0]);
-            return 0;
-        } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
-            printUsage(argv[0]);
-            return 1;
-        }
+    if (argc != 3) {
+        printf("Usage: %s <path to pointset A> <path to pointset B>\n", argv[0]);
+        return 1;
     }
 
-    if (m <= 0 || n <= 0 || dims <= 0) {
-        fprintf(stderr, "Error: Invalid point set parameters\n");
+    int m, n, dims1, dims2;    
+    int num_iter = 10, verbose = 0;
+
+    getCSVDimensions(argv[1], &m, &dims1);
+    getCSVDimensions(argv[2], &n, &dims2);
+
+    if (dims1 != dims2) {
+        fprintf(stderr, "Error: Pointsets have different dimensions (%d and %d)\n", dims1, dims2);
         return 1;
     }
     
+    int dims = dims1;
+ 
     if (m > MAX_POINTS || n > MAX_POINTS) {
         fprintf(stderr, "Error: Maximum number of points exceeded (limit: %d)\n", MAX_POINTS);
         return 1;
@@ -349,69 +330,23 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    srand(time(NULL));
-
-    generateRandomPoints(s1, m, dims, range);
-    generateRandomPoints(s2, n, dims, range);
-
-    /*
-    FILE *f1 = fopen("public_small3_pointsetA.csv", "r"),
-         *f2 = fopen("public_small3_pointsetB.csv", "r");
+    FILE *f1 = fopen(argv[1], "r"),
+         *f2 = fopen(argv[2], "r");
     readPointsFromCSV(f1, s1, m, dims);
     readPointsFromCSV(f2, s2, m, dims);
     fclose(f1);
     fclose(f2);
-    */
 
-    if (verbose) {
-        printf("Points 1: %d points, %d dimensions\n", m, dims);
-        printf("Points 2: %d points, %d dimensions\n", n, dims);
-        
-        if (verbose > 1) {
-            printf("\nPoints 1 (first few):\n");
-            for (int i = 0; i < min(5, m); i++) {
-                printf("  ");
-                for (int j = 0; j < min(5, dims); j++) {
-                    printf("%f ", s1[i * dims + j]);
-                }
-                if (dims > 5) printf("...");
-                printf("\n");
-            }
-            
-            printf("\nPoints 2 (first few):\n");
-            for (int i = 0; i < min(5, n); i++) {
-                printf("  ");
-                for (int j = 0; j < min(5, dims); j++) {
-                    printf("%f ", s2[i * dims + j]);
-                }
-                if (dims > 5) printf("...");
-                printf("\n");
-            }
-        }
-    }
-
-    // Warmup
+    // Warmup (avoids anomaly in first run)
     cudaDeviceSynchronize();
 
-    printf("m = %d, n = %d, dims = %d, num_iter = %d\n", m, n, dims, num_iter);     
-    double total_time = 0;
+    // Benchmarking    
+    double start_time = (double)clock()/CLOCKS_PER_SEC;
+    dtype distance = computeChamferDistance(s1, m, s2, n, dims, verbose);
+    double end_time = (double)clock()/CLOCKS_PER_SEC;
 
-    for (int i = 0; i < num_iter; i++) {
-        double start_time = (double)clock()/CLOCKS_PER_SEC;
-        
-        dtype distance = computeChamferDistance(s1, m, s2, n, dims, verbose);
-        
-        double end_time = (double)clock()/CLOCKS_PER_SEC;
-        double iteration_time = end_time - start_time;
-        total_time += iteration_time;
-        
-        printf("Iteration %d - Chamfer Distance: %f (Time: %.6f seconds)\n", 
-               i+1, distance, iteration_time);
-    }
-
-    printf("\nSummary:\n");
-    printf("%d iterations completed in %.6f seconds.\n", num_iter, total_time);
-    printf("Average time per iteration: %.6f seconds.\n", total_time / num_iter);
+    printf("Chamfer Distance: %f\n", distance);
+    printf("Time taken to compute Chamfer Distance: %f milliseconds\n", (end_time - start_time)*1000);
 
     free(s1);
     free(s2);
